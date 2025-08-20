@@ -2,7 +2,7 @@
 
 This project demonstrates a real-time, phone-to-browser video streaming application that performs multi-object detection and overlays the results on the live feed. It is designed to run in two modes: a high-performance **Server Mode** and a low-resource **WASM Mode**.
 
-![Demo GIF]([https://i.imgur.com/placeholder.gif](https://www.loom.com/share/cba83f3feb024f2bb8dd52bcf1dfdcf3?sid=3dad1f71-8baa-4756-91f3-39aff693267e)) 
+![Demo GIF](https://www.loom.com/share/cba83f3feb024f2bb8dd52bcf1dfdcf3?sid=3dad1f71-8baa-4756-91f3-39aff693267e)
 
 ---
 
