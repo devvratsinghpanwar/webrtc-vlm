@@ -1,0 +1,383 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import io, { Socket } from "socket.io-client";
+import { QRCodeSVG } from "qrcode.react";
+import { YOLOv5_WASM, Detection } from "../lib/inference";
+
+const SIGNALING_SERVER_URL = process.env.NEXT_PUBLIC_SIGNALING_SERVER_URL!;
+const LAPTOP_URL = process.env.NEXT_PUBLIC_LAPTOP_URL!;
+const INFERENCE_SERVER_URL = process.env.NEXT_PUBLIC_INFERENCE_SERVER_URL!;
+
+const Overlay = ({ detections }: { detections: Detection[] }) => {
+  const clamp = (v: number) => Math.max(0, Math.min(1, v));
+  if (!detections.length) return null;
+  return (
+    <div className="absolute inset-0 pointer-events-none">
+      {detections.map((det, index) => {
+        const xmin = clamp(det.xmin);
+        const ymin = clamp(det.ymin);
+        const xmax = clamp(det.xmax);
+        const ymax = clamp(det.ymax);
+        return (
+          <div
+            key={index}
+            className="absolute border-2 border-green-400"
+            style={{
+              left: `${xmin * 100}%`,
+              top: `${ymin * 100}%`,
+              width: `${(xmax - xmin) * 100}%`,
+              height: `${(ymax - ymin) * 100}%`,
+            }}
+          >
+            <p className="bg-green-400 text-black text-xs font-semibold px-1">
+              {det.label} ({(det.score * 100).toFixed(1)}%)
+            </p>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+export default function Home() {
+  const [socket, setSocket] = useState<Socket | null>(null);
+  const pc = useRef<RTCPeerConnection | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const [isPhone, setIsPhone] = useState(false);
+  const [qrUrl, setQrUrl] = useState("");
+  const [isConnected, setIsConnected] = useState(false);
+  const [detections, setDetections] = useState<Detection[]>([]);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [mode, setMode] = useState<"server" | "wasm">("server");
+  const [modelLoading, setModelLoading] = useState(false);
+  const yoloModel = useRef<YOLOv5_WASM | null>(null);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const urlMode = params.get("mode") === "wasm" ? "wasm" : "server";
+    if (params.get("role") === "phone") {
+      setIsPhone(true);
+      setMode(urlMode);
+      // Phone emits its mode to the server for sync
+      // We'll emit after socket is set (see below)
+    } else {
+      setQrUrl(`${LAPTOP_URL}?role=phone`);
+    }
+
+    const newSocket = io(SIGNALING_SERVER_URL, {
+      transports: ["websocket"],
+    });
+    setSocket(newSocket);
+
+    // Phone: emit mode-select after socket connects
+    if (params.get("role") === "phone") {
+      newSocket.on("connect", () => {
+        newSocket.emit("mode-select", urlMode);
+      });
+      if (urlMode === "wasm") {
+        setModelLoading(true);
+        const yolo = new YOLOv5_WASM();
+        yolo.init("/yolov5n.onnx").then(() => {
+          yoloModel.current = yolo;
+          setModelLoading(false);
+          console.log("WASM Model loaded successfully.");
+        }).catch(e => {
+          console.error("Failed to load WASM model", e);
+          setModelLoading(false);
+        });
+      }
+    }
+
+    return () => {
+      newSocket.close();
+      pc.current?.close();
+    };
+  }, []);
+
+  // ... WebRTC and media logic (same as your working version) ...
+  // Peer connection factory
+  const createPeerConnection = () => {
+    const configuration = {
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        {
+          urls: "turn:openrelay.metered.ca:80",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        },
+        {
+          urls: "turn:openrelay.metered.ca:443",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        },
+      ],
+    };
+    const peer = new RTCPeerConnection(configuration);
+    peer.oniceconnectionstatechange = () => {
+      if (peer.iceConnectionState === "connected") setIsConnected(true);
+      if (peer.iceConnectionState === "disconnected" || peer.iceConnectionState === "failed") setIsConnected(false);
+    };
+    peer.ontrack = (event) => {
+      if (event.streams && event.streams[0]) {
+        const stream = event.streams[0];
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = stream;
+          remoteVideoRef.current.play().catch(() => {});
+        }
+        setIsConnected(true);
+      }
+    };
+    peer.onicecandidate = (event) => {
+      if (event.candidate && socket) {
+        socket.emit("ice-candidate", event.candidate);
+      }
+    };
+    return peer;
+  };
+
+  // Main socket event effect (add mode-select sync for laptop)
+  useEffect(() => {
+    if (!socket) return;
+    socket.on("connect", () => { socket.emit("join-room"); });
+    const handleStartOffer = () => {
+      if (!isPhone) {
+        if (pc.current) pc.current.close();
+        pc.current = createPeerConnection();
+        if (pc.current.getTransceivers().length === 0) {
+          pc.current.addTransceiver("video", { direction: "recvonly" });
+        }
+        pc.current.createOffer().then(offer => {
+          pc.current!.setLocalDescription(offer);
+          socket.emit("offer", offer);
+        });
+      }
+    };
+    socket.on("start-offer", handleStartOffer);
+    socket.on("offer", async (offer) => {
+      if (!isPhone || !pc.current) return;
+      await pc.current.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.current.createAnswer();
+      await pc.current.setLocalDescription(answer);
+      socket.emit("answer", answer);
+    });
+    socket.on("answer", async (answer) => {
+      if (isPhone || !pc.current) return;
+      await pc.current.setRemoteDescription(new RTCSessionDescription(answer));
+    });
+    socket.on("ice-candidate", async (candidate) => {
+      if (pc.current) {
+        await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
+      }
+    });
+
+    // LAPTOP: Listen for mode-select from server and update mode accordingly
+    if (!isPhone) {
+      socket.on("mode-select", (newMode) => {
+        if (newMode === "wasm" || newMode === "server") {
+          setMode((prev) => {
+            if (prev !== newMode) {
+              // If switching to wasm and model not loaded, load it
+              if (newMode === "wasm" && !yoloModel.current) {
+                setModelLoading(true);
+                const yolo = new YOLOv5_WASM();
+                yolo.init("/yolov5n.onnx").then(() => {
+                  yoloModel.current = yolo;
+                  setModelLoading(false);
+                  console.log("WASM Model loaded successfully.");
+                }).catch(e => {
+                  console.error("Failed to load WASM model", e);
+                  setModelLoading(false);
+                });
+              }
+            }
+            return newMode;
+          });
+        }
+      });
+    }
+
+    return () => {
+      socket.off("start-offer", handleStartOffer);
+      socket.off("mode-select");
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+      if (localVideoRef.current) localVideoRef.current.srcObject = null;
+      if (pc.current) pc.current.close();
+    };
+  }, [socket, isPhone]);
+
+  // PHONE: get stream, add tracks, then signal ready
+  useEffect(() => {
+    if (!isPhone || !socket) return;
+    let localStream: MediaStream | null = null;
+    const startStreaming = async () => {
+      if (pc.current) pc.current.close();
+      pc.current = createPeerConnection();
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false,
+        });
+        localStream.getTracks().forEach((track) => {
+          pc.current?.addTrack(track, localStream!);
+        });
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = localStream;
+          localVideoRef.current.play().catch(() => {});
+        }
+        if (isPhone && remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = localStream;
+          remoteVideoRef.current.play().catch(() => {});
+        }
+        socket.emit("phone-ready");
+      } catch (err) {
+        alert("Could not access camera.");
+      }
+    };
+    startStreaming();
+    return () => {
+      if (localStream) localStream.getTracks().forEach((track) => track.stop());
+      if (localVideoRef.current) localVideoRef.current.srcObject = null;
+      if (pc.current) pc.current.close();
+    };
+  }, [isPhone, socket]);
+
+  // Detection loop (laptop only, supports both modes)
+  useEffect(() => {
+    if (isPhone || !isConnected || !remoteVideoRef.current) return;
+    const video = remoteVideoRef.current;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    let running = true;
+    function waitForVideoReady(cb: () => void) {
+      if (video.readyState < 2) {
+        setTimeout(() => waitForVideoReady(cb), 100);
+      } else {
+        cb();
+      }
+    }
+    const serverDetect = () => {
+      if (!running) return;
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(async (blob) => {
+        if (!blob) return;
+        const formData = new FormData();
+        formData.append("file", blob, "frame.jpg");
+        try {
+          const response = await fetch(`${INFERENCE_SERVER_URL}/detect`, { method: "POST", body: formData });
+          if (response.ok) {
+            const result = await response.json();
+            setDetections(result.detections || []);
+          } else {
+            setDetections([]);
+          }
+        } catch (error) {
+          setDetections([]);
+        }
+        if (running) setTimeout(serverDetect, 200);
+      }, "image/jpeg", 0.8);
+    };
+    const wasmDetect = async () => {
+      if (!running || !yoloModel.current) return;
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      try {
+        const dets = await yoloModel.current.detect(ctx);
+        setDetections(dets);
+        if (Array.isArray(dets) && dets.length === 0) {
+          console.log("[wasm] No detections");
+        } else {
+          console.log("[wasm] detections", dets);
+        }
+      } catch (e) {
+        setDetections([]);
+        console.error("[wasm] detection error", e);
+      }
+      if (running) requestAnimationFrame(wasmDetect);
+    };
+    waitForVideoReady(() => {
+      if (mode === 'server') {
+        serverDetect();
+      } else if (mode === 'wasm') {
+        if (modelLoading) {
+          console.log("[wasm] Waiting for model to load...");
+        } else if (yoloModel.current) {
+          console.log("[wasm] Starting detection loop");
+          wasmDetect();
+        } else {
+          console.log("[wasm] Model not loaded yet");
+        }
+      }
+    });
+    return () => { running = false; };
+  }, [isConnected, isPhone, mode, modelLoading]);
+
+  return (
+    <main className="flex min-h-screen items-center justify-center p-8 bg-gray-900 text-white flex-col">
+      <h1 className="text-4xl font-bold mb-4">WebRTC Live Stream + Object Detection</h1>
+      <div className="flex space-x-4 mb-4">
+        <p>Current Mode: <strong className="uppercase">{mode}</strong></p>
+        {modelLoading && <p className="text-yellow-500"> (Model Loading...)</p>}
+        {isPhone && (
+          <span className="ml-4 px-2 py-1 bg-blue-700 rounded text-xs">PHONE</span>
+        )}
+        {!isPhone && (
+          <span className="ml-4 px-2 py-1 bg-green-700 rounded text-xs">LAPTOP</span>
+        )}
+      </div>
+      <div className="w-full max-w-4xl border-2 border-dashed border-gray-700 aspect-video rounded-md p-4 bg-black relative">
+        <video
+          ref={remoteVideoRef}
+          autoPlay
+          playsInline
+          muted
+          className="w-full h-full object-contain"
+        />
+        <Overlay detections={detections} />
+        <canvas ref={canvasRef} className="hidden" />
+        {!isConnected && !isPhone && (
+          <div className="absolute inset-0 bg-black bg-opacity-70 flex flex-col justify-center items-center">
+            <p className="text-2xl mb-2">Waiting for phone...</p>
+            <p className="text-gray-400">Scan the QR code below:</p>
+          </div>
+        )}
+      </div>
+      {!isPhone && !isConnected && (
+        <div className="mt-6 flex flex-col items-center">
+          {qrUrl && (
+            <div className="p-4 bg-white rounded-md">
+              <QRCodeSVG value={qrUrl} size={256} />
+              <p className="text-black text-center mt-2">Scan for Server Mode</p>
+              <QRCodeSVG value={`${qrUrl}&mode=wasm`} size={256} className="mt-4" />
+              <p className="text-black text-center mt-2">Scan for WASM Mode</p>
+            </div>
+          )}
+          <button
+            onClick={() => {
+              if (!pc.current) return;
+              if (pc.current.getTransceivers().length === 0) {
+                pc.current.addTransceiver("video", { direction: "recvonly" });
+              }
+              pc.current.createOffer().then(offer => {
+                pc.current!.setLocalDescription(offer);
+                socket?.emit("offer", offer);
+              });
+            }}
+            className="mt-4 bg-blue-500 px-4 py-2 rounded"
+          >
+            Restart Offer
+          </button>
+        </div>
+      )}
+    </main>
+  );
+}
+

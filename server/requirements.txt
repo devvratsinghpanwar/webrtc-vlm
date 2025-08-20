@@ -1,0 +1,7 @@
+# server/requirements.txt
+fastapi
+uvicorn
+onnxruntime
+numpy
+Pillow
+python-multipart
