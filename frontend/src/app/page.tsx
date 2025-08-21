@@ -5,9 +5,9 @@ import io, { Socket } from "socket.io-client";
 import { QRCodeSVG } from "qrcode.react";
 import { YOLOv5_WASM, Detection } from "../lib/inference";
 
-const SIGNALING_SERVER_URL = process.env.NEXT_PUBLIC_SIGNALING_SERVER_URL!;
-const LAPTOP_URL = process.env.NEXT_PUBLIC_LAPTOP_URL!;
-const INFERENCE_SERVER_URL = process.env.NEXT_PUBLIC_INFERENCE_SERVER_URL!;
+const SIGNALING_SERVER_URL = "https://f390d010918839b1e8656d5717152d0c.serveo.net";
+const LAPTOP_URL = "https://8d7eeca333ea59e06171f62f3c68f069.serveo.net";
+const INFERENCE_SERVER_URL = "https://09d895fe55b3.ngrok-free.app";
 
 const Overlay = ({ detections }: { detections: Detection[] }) => {
   const clamp = (v: number) => Math.max(0, Math.min(1, v));
